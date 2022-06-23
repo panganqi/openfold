@@ -296,7 +296,7 @@ config = mlc.ConfigDict(
                 "max_templates": 4,
                 "shuffle_top_k_prefiltered": 20,
                 "crop": True,
-                "crop_size": 256,
+                "crop_size": 512,
                 "supervised": True,
                 "clamp_prob": 0.9,
                 "max_distillation_msa_clusters": 1000,
