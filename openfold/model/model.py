@@ -103,9 +103,16 @@ class AlphaFold(nn.Module):
             config["heads"],
         )
 
-        self.config = config
+    def embed_templates(self, batch, z, pair_mask, templ_dim, inplace_safe): 
+        if(self.template_config.offload_templates):
+            return embed_templates_offload(self, 
+                batch, z, pair_mask, templ_dim, inplace_safe=inplace_safe,
+            )
+        elif(self.template_config.average_templates):
+            return embed_templates_average(self, 
+                batch, z, pair_mask, templ_dim, inplace_safe=inplace_safe,
+            )
 
-    def embed_templates(self, batch, z, pair_mask, templ_dim): 
         # Embed the templates one at a time (with a poor man's vmap)
         template_embeds = []
         n_templ = batch["template_aatype"].shape[templ_dim]
@@ -150,6 +157,8 @@ class AlphaFold(nn.Module):
             template_embeds["pair"], 
             pair_mask.unsqueeze(-3).to(dtype=z.dtype), 
             chunk_size=self.globals.chunk_size,
+            use_lma=self.globals.use_lma,
+            inplace_safe=inplace_safe,
             _mask_trans=self.config._mask_trans,
         )
 
@@ -163,10 +172,13 @@ class AlphaFold(nn.Module):
         t = t * (torch.sum(batch["template_mask"]) > 0)
 
         ret = {}
-        if self.config.template.embed_angles:
-            ret["template_angle_embedding"] = template_embeds["angle"]
 
         ret.update({"template_pair_embedding": t})
+
+        del t
+
+        if self.config.template.embed_angles:
+            ret["template_angle_embedding"] = template_embeds["angle"]
 
         return ret
 
@@ -186,6 +198,10 @@ class AlphaFold(nn.Module):
         n = feats["target_feat"].shape[-2]
         n_seq = feats["msa_feat"].shape[-3]
         device = feats["target_feat"].device
+        
+        # Controls whether the model uses in-place operations throughout
+        # The dual condition accounts for activation checkpoints
+        inplace_safe = not (self.training or torch.is_grad_enabled())
 
         # Prep some features
         seq_mask = feats["seq_mask"]
@@ -200,9 +216,16 @@ class AlphaFold(nn.Module):
             feats["target_feat"],
             feats["residue_index"],
             feats["msa_feat"],
+            inplace_safe=inplace_safe,
         )
 
-        # Initialize the recycling embeddings, if needs be
+
+        # Unpack the recycling embeddings. Removing them from the list allows 
+        # them to be freed further down in this function, saving memory
+        m_1_prev, z_prev, x_prev = reversed([prevs.pop() for _ in range(3)])
+
+        # Initialize the recycling embeddings, if needs be 
+
         if None in [m_1_prev, z_prev, x_prev]:
             # [*, N, C_m]
             m_1_prev = m.new_zeros(
@@ -226,33 +249,40 @@ class AlphaFold(nn.Module):
             feats["aatype"], x_prev, None
         ).to(dtype=z.dtype)
 
+        # The recycling embedder is memory-intensive, so we offload first
+        if(self.globals.offload_inference and inplace_safe):
+            m = m.cpu()
+            z = z.cpu()
+
         # m_1_prev_emb: [*, N, C_m]
         # z_prev_emb: [*, N, N, C_z]
         m_1_prev_emb, z_prev_emb = self.recycling_embedder(
             m_1_prev,
             z_prev,
             x_prev,
+
+            inplace_safe=inplace_safe,
         )
 
-        # If the number of recycling iterations is 0, skip recycling
-        # altogether. We zero them this way instead of computing them
-        # conditionally to avoid leaving parameters unused, which has annoying
-        # implications for DDP training.
-        if(not _recycle):
-            m_1_prev_emb *= 0
-            z_prev_emb *= 0
+        if(self.globals.offload_inference and inplace_safe):
+            m = m.to(m_1_prev_emb.device)
+            z = z.to(z_prev.device)
+
 
         # [*, S_c, N, C_m]
         m[..., 0, :, :] += m_1_prev_emb
 
         # [*, N, N, C_z]
-        z += z_prev_emb
+        z = add(z, z_prev_emb, inplace=inplace_safe)
 
-        # Possibly prevents memory fragmentation
+
+        # Deletions like these become significant for inference with large N,
+        # where they free unused tensors and remove references to others such
+        # that they can be offloaded later
         del m_1_prev, z_prev, x_prev, m_1_prev_emb, z_prev_emb
 
         # Embed the templates + merge with MSA/pair embeddings
-        if self.config.template.enabled:
+        if self.config.template.enabled: 
             template_feats = {
                 k: v for k, v in feats.items() if k.startswith("template_")
             }
@@ -261,12 +291,13 @@ class AlphaFold(nn.Module):
                 z,
                 pair_mask.to(dtype=z.dtype),
                 no_batch_dims,
+                inplace_safe=inplace_safe,
             )
 
             # [*, N, N, C_z]
             z = z + template_embeds["template_pair_embedding"]
 
-            if self.config.template.embed_angles:
+            if "template_angle_embedding" in template_embeds:
                 # [*, S = S_c + S_t, N, C_m]
                 m = torch.cat(
                     [m, template_embeds["template_angle_embedding"]], 
@@ -285,39 +316,78 @@ class AlphaFold(nn.Module):
             # [*, S_e, N, C_e]
             a = self.extra_msa_embedder(build_extra_msa_feat(feats))
 
-            # [*, N, N, C_z]
-            z = self.extra_msa_stack(
-                a,
-                z,
-                msa_mask=feats["extra_msa_mask"].to(dtype=a.dtype),
-                chunk_size=self.globals.chunk_size,
-                pair_mask=pair_mask.to(dtype=z.dtype),
-                _mask_trans=self.config._mask_trans,
-            )
+
+            if(self.globals.offload_inference):
+                # To allow the extra MSA stack (and later the evoformer) to
+                # offload its inputs, we remove all references to them here
+                input_tensors = [a, z]
+                del a, z
+    
+                # [*, N, N, C_z]
+                z = self.extra_msa_stack._forward_offload(
+                    input_tensors,
+                    msa_mask=feats["extra_msa_mask"].to(dtype=m.dtype),
+                    chunk_size=self.globals.chunk_size,
+                    use_lma=self.globals.use_lma,
+                    pair_mask=pair_mask.to(dtype=m.dtype),
+                    _mask_trans=self.config._mask_trans,
+                )
+    
+                del input_tensors
+            else:
+                # [*, N, N, C_z]
+                z = self.extra_msa_stack(
+                    a, z,
+                    msa_mask=feats["extra_msa_mask"].to(dtype=m.dtype),
+                    chunk_size=self.globals.chunk_size,
+                    use_lma=self.globals.use_lma,
+                    pair_mask=pair_mask.to(dtype=m.dtype),
+                    inplace_safe=inplace_safe,
+                    _mask_trans=self.config._mask_trans,
+                )
 
         # Run MSA + pair embeddings through the trunk of the network
         # m: [*, S, N, C_m]
         # z: [*, N, N, C_z]
-        # s: [*, N, C_s]
-        m, z, s = self.evoformer(
-            m,
-            z,
-            msa_mask=msa_mask.to(dtype=m.dtype),
-            pair_mask=pair_mask.to(dtype=z.dtype),
-            chunk_size=self.globals.chunk_size,
-            _mask_trans=self.config._mask_trans,
-        )
+        # s: [*, N, C_s]          
+        if(self.globals.offload_inference):
+            input_tensors = [m, z]
+            del m, z
+            m, z, s = self.evoformer._forward_offload(
+                input_tensors,
+                msa_mask=msa_mask.to(dtype=input_tensors[0].dtype),
+                pair_mask=pair_mask.to(dtype=input_tensors[1].dtype),
+                chunk_size=self.globals.chunk_size,
+                use_lma=self.globals.use_lma,
+                _mask_trans=self.config._mask_trans,
+            )
+    
+            del input_tensors
+        else:
+            m, z, s = self.evoformer(
+                m,
+                z,
+                msa_mask=msa_mask.to(dtype=m.dtype),
+                pair_mask=pair_mask.to(dtype=z.dtype),
+                chunk_size=self.globals.chunk_size,
+                use_lma=self.globals.use_lma,
+                inplace_safe=inplace_safe,
+                _mask_trans=self.config._mask_trans,
+            )
 
         outputs["msa"] = m[..., :n_seq, :, :]
         outputs["pair"] = z
         outputs["single"] = s
 
+        del z
+
         # Predict 3D structure
         outputs["sm"] = self.structure_module(
-            s,
-            z,
+            outputs,
             feats["aatype"],
             mask=feats["seq_mask"].to(dtype=s.dtype),
+            inplace_safe=inplace_safe,
+            _offload_inference=self.globals.offload_inference,
         )
         outputs["final_atom_positions"] = atom14_to_atom37(
             outputs["sm"]["positions"][-1], feats
@@ -331,7 +401,7 @@ class AlphaFold(nn.Module):
         m_1_prev = m[..., 0, :, :]
 
         # [*, N, N, C_z]
-        z_prev = z
+        z_prev = outputs["pair"]
 
         # [*, N, 3]
         x_prev = outputs["final_atom_positions"]
