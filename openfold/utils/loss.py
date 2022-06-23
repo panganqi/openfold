@@ -1479,9 +1479,9 @@ def experimentally_resolved_loss(
     loss = loss / (eps + torch.sum(atom37_atom_exists, dim=(-1, -2)))
     loss = torch.sum(loss, dim=-1)
 
-    # loss = loss * (
-    #     (resolution >= min_resolution) & (resolution <= max_resolution)
-    # )
+    loss = loss * (
+        (resolution >= min_resolution) & (resolution <= max_resolution)
+    )
 
     loss = torch.mean(loss)
  
