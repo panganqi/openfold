@@ -1,12 +1,6 @@
 import argparse
 import logging
 import os
-
-#os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-#os.environ["MASTER_ADDR"]="10.119.81.14"
-#os.environ["MASTER_PORT"]="42069"
-#os.environ["NODE_RANK"]="0"
-
 import random
 import sys
 import time
@@ -44,7 +38,8 @@ from openfold.utils.validation_metrics import (
     gdt_ha,
 )
 from scripts.zero_to_fp32 import (
-    get_fp32_state_dict_from_zero_checkpoint
+    get_fp32_state_dict_from_zero_checkpoint,
+    get_global_step_from_zero_checkpoint
 )
 
 from openfold.utils.logger import PerformanceLoggingCallback
@@ -53,6 +48,14 @@ from openfold.utils.import_weights import (
     import_jax_weights_,
 )
 
+def add_noise_to_weights(m):
+    scale = 0.8
+    with torch.no_grad():
+        if hasattr(m, 'weight'):
+            # m.weight.add_(torch.randn(m.weight.size()) * 0.1)
+            print("========================the scale is ==================")
+            print(scale)
+            m.weight.mul_(torch.randn(m.weight.size()) * (1-scale)*2+scale)
 
 class OpenFoldWrapper(pl.LightningModule):
     def __init__(self, config):
@@ -65,7 +68,7 @@ class OpenFoldWrapper(pl.LightningModule):
         )
         
         self.cached_weights = None
-        self.last_lr_step = 0
+        self.last_lr_step = -1
 
 
 
@@ -81,7 +84,7 @@ class OpenFoldWrapper(pl.LightningModule):
             )
 
             import_jax_weights_(model, param_path, version=model_name)
-            #script_preset_(model)
+            script_preset_(model)
             model.apply(add_noise_to_weights)
             self.model = model
             print('loading succeed')
@@ -125,7 +128,7 @@ class OpenFoldWrapper(pl.LightningModule):
 
         # Run the model
         outputs = self(batch)
-        
+
         # Remove the recycling dimension
         batch = tensor_tree_map(lambda t: t[..., -1], batch)
 
@@ -135,7 +138,7 @@ class OpenFoldWrapper(pl.LightningModule):
         )
 
         # Log it
-        self._log(loss_breakdown, batch, outputs)
+        # self._log(loss_breakdown, batch, outputs)
 
         return loss
 
@@ -227,12 +230,23 @@ class OpenFoldWrapper(pl.LightningModule):
         learning_rate: float = 1e-3,
         eps: float = 1e-5,
     ) -> torch.optim.Adam:
+#        return torch.optim.Adam(
+#            self.model.parameters(),
+#            lr=learning_rate,
+#            eps=eps
+#        )
         # Ignored as long as a DeepSpeed optimizer is configured
         optimizer = torch.optim.Adam(
             self.model.parameters(), 
             lr=learning_rate, 
             eps=eps
         )
+
+        if self.last_lr_step != -1:
+            for group in optimizer.param_groups:
+                if 'initial_lr' not in group:
+                    group['initial_lr'] = learning_rate
+
         lr_scheduler = AlphaFoldLRScheduler(
             optimizer,
         )
@@ -247,10 +261,16 @@ class OpenFoldWrapper(pl.LightningModule):
         }
 
     def on_load_checkpoint(self, checkpoint):
-        self.ema.load_state_dict(checkpoint["ema"])
+        ema = checkpoint["ema"]
+        if(not self.model.template_config.enabled):
+            ema["params"] = {k:v for k,v in ema["params"].items() if not "template" in k}
+        self.ema.load_state_dict(ema)
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["ema"] = self.ema.state_dict()
+
+    def resume_last_lr_step(self, lr_step):
+        self.last_lr_step = lr_step
 
 
 def main(args):
@@ -260,12 +280,23 @@ def main(args):
     config = model_config(
         args.config_preset, 
         train=True, 
-        low_prec=(args.precision == "16")
+        low_prec=(str(args.precision) == "16")
     ) 
     
     model_module = OpenFoldWrapper(config)
+    if(args.resume_from_ckpt):
+        if(os.path.isdir(args.resume_from_ckpt)):  
+            last_global_step = get_global_step_from_zero_checkpoint(args.resume_from_ckpt)
+        else:
+            sd = torch.load(args.resume_from_ckpt)
+            last_global_step = int(sd['global_step'])
+        model_module.resume_last_lr_step(last_global_step)
+        logging.info("Successfully loaded last lr step...")
     if(args.resume_from_ckpt and args.resume_model_weights_only):
-        sd = get_fp32_state_dict_from_zero_checkpoint(args.resume_from_ckpt)
+        if(os.path.isdir(args.resume_from_ckpt)):
+            sd = get_fp32_state_dict_from_zero_checkpoint(args.resume_from_ckpt)
+        else:
+            sd = torch.load(args.resume_from_ckpt)
         sd = {k[len("module."):]:v for k,v in sd.items()}
         model_module.load_state_dict(sd)
         logging.info("Successfully loaded model weights...")
@@ -350,8 +381,8 @@ def main(args):
         default_root_dir=args.output_dir,
         strategy=strategy,
         callbacks=callbacks,
-        logger=loggers,
-        check_val_every_n_epoch=20,
+        # logger=loggers,
+        check_val_every_n_epoch=3,
     )
 
     if(args.resume_model_weights_only):
@@ -401,11 +432,11 @@ if __name__ == "__main__":
                 filtered by the release date of the target'''
     )
     parser.add_argument(
-        "--distillation_data_dir", type=str, default='/public/home/pangaq/folding/data/AF2_dis/data_merge',
+        "--distillation_data_dir", type=str, default=None,
         help="Directory containing training PDB files"
     )
     parser.add_argument(
-        "--distillation_alignment_dir", type=str, default='/public/home/pangaq/folding/data/AF2_dis/alignment_merge',
+        "--distillation_alignment_dir", type=str, default=None,
         help="Directory containing precomputed distillation alignments"
     )
     parser.add_argument(
@@ -421,14 +452,14 @@ if __name__ == "__main__":
         help="Path to the kalign binary"
     )
     parser.add_argument(
-        "--train_mapping_path", type=str, default=None,
-        help='''Optional path to a .json file containing a mapping from
-                consecutive numerical indices to sample names. Used to filter
-                the training set'''
+        "--train_filter_path", type=str, default=None,
+        help='''Optional path to a text file containing names of training
+                examples to include, one per line. Used to filter the training 
+                set'''
     )
     parser.add_argument(
-        "--distillation_mapping_path", type=str, default=None,
-        help="""See --train_mapping_path"""
+        "--distillation_filter_path", type=str, default=None,
+        help="""See --train_filter_path"""
     )
     parser.add_argument(
         "--obsolete_pdbs_file_path", type=str, default='/public/home/pangaq/openfold/data/pdb_mmcif/obsolete.dat',
@@ -536,10 +567,12 @@ if __name__ == "__main__":
         "--_distillation_structure_index_path", type=str, default=None,
     )
     parser.add_argument(
-        "--_alignment_index_path", type=str, default=None,
+        "--alignment_index_path", type=str, default=None,
+        help="Training alignment index. See the README for instructions."
     )
     parser.add_argument(
-        "--_distillation_alignment_index_path", type=str, default=None,
+        "--distillation_alignment_index_path", type=str, default=None,
+        help="Distillation alignment index. See the README for instructions."
     )
     parser = pl.Trainer.add_argparse_args(parser)
    
@@ -567,6 +600,6 @@ if __name__ == "__main__":
         raise ValueError("For distributed training, --seed must be specified")
 
     # This re-applies the training-time filters at the beginning of every epoch
-    args.reload_dataloaders_every_n_epochs = 1
+    # args.reload_dataloaders_every_n_epochs = 1
 
     main(args)
