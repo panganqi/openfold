@@ -53,6 +53,14 @@ from openfold.utils.import_weights import (
     import_jax_weights_,
 )
 
+def add_noise_to_weights(m):
+    scale = 0.8
+    with torch.no_grad():
+        if hasattr(m, 'weight'):
+            # m.weight.add_(torch.randn(m.weight.size()) * 0.1)
+            print("========================the scale is ==================")
+            print(scale)
+            m.weight.mul_(torch.randn(m.weight.size()) * (1-scale)*2+scale)
 
 class OpenFoldWrapper(pl.LightningModule):
     def __init__(self, config):
@@ -81,7 +89,7 @@ class OpenFoldWrapper(pl.LightningModule):
             )
 
             import_jax_weights_(model, param_path, version=model_name)
-            #script_preset_(model)
+            script_preset_(model)
             model.apply(add_noise_to_weights)
             self.model = model
             print('loading succeed')
@@ -135,7 +143,7 @@ class OpenFoldWrapper(pl.LightningModule):
         )
 
         # Log it
-        self._log(loss_breakdown, batch, outputs)
+        # self._log(loss_breakdown, batch, outputs)
 
         return loss
 
@@ -350,8 +358,8 @@ def main(args):
         default_root_dir=args.output_dir,
         strategy=strategy,
         callbacks=callbacks,
-        logger=loggers,
-        check_val_every_n_epoch=20,
+        # logger=loggers,
+        check_val_every_n_epoch=3,
     )
 
     if(args.resume_model_weights_only):
@@ -401,11 +409,11 @@ if __name__ == "__main__":
                 filtered by the release date of the target'''
     )
     parser.add_argument(
-        "--distillation_data_dir", type=str, default='/public/home/pangaq/folding/data/AF2_dis/data_merge',
+        "--distillation_data_dir", type=str, default=None,
         help="Directory containing training PDB files"
     )
     parser.add_argument(
-        "--distillation_alignment_dir", type=str, default='/public/home/pangaq/folding/data/AF2_dis/alignment_merge',
+        "--distillation_alignment_dir", type=str, default=None,
         help="Directory containing precomputed distillation alignments"
     )
     parser.add_argument(
@@ -567,6 +575,6 @@ if __name__ == "__main__":
         raise ValueError("For distributed training, --seed must be specified")
 
     # This re-applies the training-time filters at the beginning of every epoch
-    args.reload_dataloaders_every_n_epochs = 1
+    # args.reload_dataloaders_every_n_epochs = 1
 
     main(args)

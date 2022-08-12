@@ -108,8 +108,8 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
 
         file_list_ori = os.listdir(alignment_dir)
         self.file_list_ori = file_list_ori
-        with open("/public/home/pangaq/folding/data/AF2_dis/novel/num_1278.txt","r") as f:
-            novel_list = [l.strip() for l in f.readlines()]
+        # with open("/public/home/pangaq/folding/data/AF2_dis/novel/num_1278.txt","r") as f:
+        #     novel_list = [l.strip() for l in f.readlines()]
         file_list = file_list_ori
         # if(treat_pdb_as_distillation):
         #     random.shuffle(file_list_ori)
@@ -246,11 +246,11 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         #     )
         name = self.idx_to_chain_id(idx)
 
-        if(idx == len(self._chain_ids) -500 ):
-            print('shuffle for the end')
-            random.shuffle(self.file_list_ori)
-            file_list = self.file_list_ori[:self._alignment_lenth]
-            self._chain_ids = list(file_list)
+        # if(idx == len(self._chain_ids) -500 ):
+        #     print('shuffle for the end')
+        #     random.shuffle(self.file_list_ori)
+        #     file_list = self.file_list_ori[:self._alignment_lenth]
+        #     self._chain_ids = list(file_list)
 
 
 
