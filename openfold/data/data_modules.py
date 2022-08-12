@@ -39,11 +39,11 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         template_release_dates_cache_path: Optional[str] = None,
         shuffle_top_k_prefiltered: Optional[int] = None,
         treat_pdb_as_distillation: bool = True,
-        mapping_path: Optional[str] = None,
+        filter_path: Optional[str] = None,
         mode: str = "train", 
+        alignment_index: Optional[Any] = None,
         _output_raw: bool = False,
         _structure_index: Optional[Any] = None,
-        _alignment_index: Optional[Any] = None,
     ):
         """
             Args:
@@ -89,10 +89,12 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         self.config = config
         self.treat_pdb_as_distillation = treat_pdb_as_distillation
         self.mode = mode
+        self.alignment_index = alignment_index
         self._output_raw = _output_raw
         self._structure_index = _structure_index
         self._alignment_index = _alignment_index
         self._alignment_lenth = 0
+
 
         self.supported_exts = [".cif", ".core", ".pdb"]
 
@@ -111,14 +113,14 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         # with open("/public/home/pangaq/folding/data/AF2_dis/novel/num_1278.txt","r") as f:
         #     novel_list = [l.strip() for l in f.readlines()]
         file_list = file_list_ori
-        # if(treat_pdb_as_distillation):
-        #     random.shuffle(file_list_ori)
-        #     self._alignment_lenth = 3000
-        #     file_list = file_list_ori[:self._alignment_lenth]
-        # else:
-        #     random.shuffle(file_list_ori)
-        #     self._alignment_lenth = 9000
-        #     file_list = file_list_ori[:self._alignment_lenth]
+        if(treat_pdb_as_distillation):
+            random.shuffle(file_list_ori)
+            self._alignment_lenth = 3000
+            file_list = file_list_ori[:self._alignment_lenth]
+        else:
+            random.shuffle(file_list_ori)
+            self._alignment_lenth = 9000
+            file_list = file_list_ori[:self._alignment_lenth]
 
         # if(len(file_list[0])==len(novel_list[0])):
         #     file_list = file_list +novel_list
@@ -128,8 +130,13 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         elif(mapping_path is None):
             self._chain_ids = file_list
         else:
-            with open(mapping_path, "r") as f:
-                self._chain_ids = [l.strip() for l in f.readlines()]
+            self._chain_ids = list(os.listdir(alignment_dir))
+        
+        if(filter_path is not None):
+            with open(filter_path, "r") as f:
+                chains_to_include = set([l.strip() for l in f.readlines()])
+
+            self._chain_ids = [c for c in self._chain_ids if c in chains_to_include]
        
         self._chain_id_to_idx_dict = {
             chain: i for i, chain in enumerate(self._chain_ids)
@@ -152,7 +159,7 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         if(not self._output_raw):
             self.feature_pipeline = feature_pipeline.FeaturePipeline(config) 
 
-    def _parse_mmcif(self, path, file_id, chain_id, alignment_dir, _alignment_index):
+    def _parse_mmcif(self, path, file_id, chain_id, alignment_dir, alignment_index):
         with open(path, 'r') as f:
             mmcif_string = f.read()
 
@@ -171,7 +178,7 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
             mmcif=mmcif_object,
             alignment_dir=alignment_dir,
             chain_id=chain_id,
-            _alignment_index=_alignment_index
+            alignment_index=alignment_index
         )
 
         return data
@@ -246,11 +253,15 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
         #     )
         name = self.idx_to_chain_id(idx)
 
-        # if(idx == len(self._chain_ids) -500 ):
-        #     print('shuffle for the end')
-        #     random.shuffle(self.file_list_ori)
-        #     file_list = self.file_list_ori[:self._alignment_lenth]
-        #     self._chain_ids = list(file_list)
+        if(idx == len(self._chain_ids) -500 ):
+            print('shuffle for the end')
+            random.shuffle(self.file_list_ori)
+            file_list = self.file_list_ori[:self._alignment_lenth]
+            self._chain_ids = list(file_list)
+        # alignment_index = None
+        # if(self.alignment_index is not None):
+        #     alignment_dir = self.alignment_dir
+        #     alignment_index = self.alignment_index[name]
 
 
 
@@ -307,6 +318,7 @@ class OpenFoldSingleDataset(torch.utils.data.Dataset):
                 )
             with open(pkl_path, 'wb') as f:
                 pickle.dump(data,f)
+
 
         if(self._output_raw):
             return data
@@ -580,15 +592,15 @@ class OpenFoldDataModule(pl.LightningDataModule):
         predict_data_dir: Optional[str] = None,
         predict_alignment_dir: Optional[str] = None,
         kalign_binary_path: str = '/usr/bin/kalign',
-        train_mapping_path: Optional[str] = None,
-        distillation_mapping_path: Optional[str] = None,
+        train_filter_path: Optional[str] = None,
+        distillation_filter_path: Optional[str] = None,
         obsolete_pdbs_file_path: Optional[str] = None,
         template_release_dates_cache_path: Optional[str] = None,
         batch_seed: Optional[int] = None,
         train_epoch_len: int = 50000, 
         _distillation_structure_index_path: Optional[str] = None,
-        _alignment_index_path: Optional[str] = None,
-        _distillation_alignment_index_path: Optional[str] = None,
+        alignment_index_path: Optional[str] = None,
+        distillation_alignment_index_path: Optional[str] = None,
         **kwargs
     ):
         super(OpenFoldDataModule, self).__init__()
@@ -609,8 +621,8 @@ class OpenFoldDataModule(pl.LightningDataModule):
         self.predict_data_dir = predict_data_dir
         self.predict_alignment_dir = predict_alignment_dir
         self.kalign_binary_path = kalign_binary_path
-        self.train_mapping_path = train_mapping_path
-        self.distillation_mapping_path = distillation_mapping_path
+        self.train_filter_path = train_filter_path
+        self.distillation_filter_path = distillation_filter_path
         self.template_release_dates_cache_path = (
             template_release_dates_cache_path
         )
@@ -646,15 +658,15 @@ class OpenFoldDataModule(pl.LightningDataModule):
             with open(_distillation_structure_index_path, "r") as fp:
                 self._distillation_structure_index = json.load(fp)
         
-        self._alignment_index = None
-        if(_alignment_index_path is not None):
-            with open(_alignment_index_path, "r") as fp:
-                self._alignment_index = json.load(fp)
+        self.alignment_index = None
+        if(alignment_index_path is not None):
+            with open(alignment_index_path, "r") as fp:
+                self.alignment_index = json.load(fp)
 
-        self._distillation_alignment_index = None
-        if(_distillation_alignment_index_path is not None):
-            with open(_distillation_alignment_index_path, "r") as fp:
-                self._distillation_alignment_index = json.load(fp)
+        self.distillation_alignment_index = None
+        if(distillation_alignment_index_path is not None):
+            with open(distillation_alignment_index_path, "r") as fp:
+                self.distillation_alignment_index = json.load(fp)
 
     def setup(self):
         # Most of the arguments are the same for the three datasets 
@@ -673,13 +685,13 @@ class OpenFoldDataModule(pl.LightningDataModule):
             train_dataset = dataset_gen(
                 data_dir=self.train_data_dir,
                 alignment_dir=self.train_alignment_dir,
-                mapping_path=self.train_mapping_path,
+                filter_path=self.train_filter_path,
                 max_template_hits=self.config.train.max_template_hits,
                 shuffle_top_k_prefiltered=
                     self.config.train.shuffle_top_k_prefiltered,
                 treat_pdb_as_distillation=False,
                 mode="train",
-                _alignment_index=self._alignment_index,
+                alignment_index=self.alignment_index,
             )
             self.train_dataset = train_dataset
             distillation_dataset = None
@@ -687,12 +699,12 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 distillation_dataset = dataset_gen(
                     data_dir=self.distillation_data_dir,
                     alignment_dir=self.distillation_alignment_dir,
-                    mapping_path=self.distillation_mapping_path,
+                    filter_path=self.distillation_filter_path,
                     max_template_hits=self.config.train.max_template_hits,
                     treat_pdb_as_distillation=True,
                     mode="train",
+                    alignment_index=self.distillation_alignment_index,
                     _structure_index=self._distillation_structure_index,
-                    _alignment_index=self._distillation_alignment_index,
                 )
 
                 # d_prob = self.config.train.distillation_prob
@@ -725,7 +737,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 self.eval_dataset = dataset_gen(
                     data_dir=self.val_data_dir,
                     alignment_dir=self.val_alignment_dir,
-                    mapping_path=None,
+                    filter_path=None,
                     max_template_hits=self.config.eval.max_template_hits,
                     mode="eval",
                 )
@@ -735,7 +747,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
             self.predict_dataset = dataset_gen(
                 data_dir=self.predict_data_dir,
                 alignment_dir=self.predict_alignment_dir,
-                mapping_path=None,
+                filter_path=None,
                 max_template_hits=self.config.predict.max_template_hits,
                 mode="predict",
             )
